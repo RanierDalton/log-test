@@ -1,50 +1,87 @@
-const AWS = require('aws-sdk');
+const AWS = require("aws-sdk");
 
-AWS.config.update({ region: "us-east-1" }); // ajuste sua região
+AWS.config.update({ region: "us-east-1" }); // ajuste para sua região
 
 const lambda = new AWS.Lambda();
 const cloudwatchlogs = new AWS.CloudWatchLogs();
 
-async function getAllLambdaLogs() {
+const blacklist = ["MainMonitoringFunction", "ModLabRole"];
+const keywords = ["ERROR", "Exception", "Traceback"];
+
+async function getLambdaFunctions() {
+    let functions = [];
+    let Marker;
+
+    do {
+        const response = await lambda.listFunctions({ Marker }).promise();
+        functions.push(...response.Functions);
+        Marker = response.NextMarker;
+    } while (Marker);
+
+    return functions
+        .map(f => f.FunctionName)
+        .filter(name => !blacklist.includes(name));
+}
+
+async function getLogStreams(logGroupName) {
     try {
-        const functionsData = await lambda.listFunctions().promise();
-
-        for (const func of functionsData.Functions) {
-            const logGroupName = `/aws/lambda/${func.FunctionName}`;
-            console.log(`📘 Verificando logs da função: ${func.FunctionName}`);
-
-            try {
-                const streamsData = await cloudwatchlogs.describeLogStreams({
-                    logGroupName,
-                    orderBy: "LastEventTime",
-                    descending: true,
-                    limit: 3 // você pode ajustar isso
-                }).promise();
-
-                for (const stream of streamsData.logStreams) {
-                    const logEventsData = await cloudwatchlogs.getLogEvents({
-                        logGroupName,
-                        logStreamName: stream.logStreamName,
-                        startTime: Date.now() - 1000 * 60 * 60 * 1, // Última 1 hora
-                        endTime: Date.now()
-                    }).promise();
-
-                    console.log(`📝 Logs de ${func.FunctionName} / ${stream.logStreamName}:`);
-                    for (const event of logEventsData.events) {
-                        console.log(`- ${event.message.trim()}`);
-                    }
-                }
-            } catch (err) {
-                if (err.code === 'ResourceNotFoundException') {
-                    console.log(`⚠️ Sem logs encontrados para: ${func.FunctionName}`);
-                } else {
-                    console.error(`Erro ao acessar logs de ${func.FunctionName}:`, err);
-                }
-            }
-        }
+        const response = await cloudwatchlogs.describeLogStreams({
+            logGroupName,
+            orderBy: "LastEventTime",
+            descending: true,
+            limit: 5 // ajustável
+        }).promise();
+        return response.logStreams.map(stream => stream.logStreamName);
     } catch (err) {
-        console.error("Erro ao listar funções Lambda:", err);
+        if (err.code === "ResourceNotFoundException") return [];
+        throw err;
     }
 }
 
-getAllLambdaLogs();
+async function getErrorEvents(logGroupName, logStreamName) {
+    const response = await cloudwatchlogs.getLogEvents({
+        logGroupName,
+        logStreamName,
+        startTime: Date.now() - 1000 * 60 * 60 * 2, // últimas 2 horas
+        endTime: Date.now()
+    }).promise();
+
+    return response.events.filter(event =>
+        keywords.some(keyword => event.message.includes(keyword))
+    );
+}
+
+async function main() {
+    const lambdaNames = await getLambdaFunctions();
+    const allErrors = [];
+
+    for (const lambdaName of lambdaNames) {
+        const logGroupName = `/aws/lambda/${lambdaName}`;
+        const streams = await getLogStreams(logGroupName);
+
+        for (const streamName of streams) {
+            const events = await getErrorEvents(logGroupName, streamName);
+            for (const event of events) {
+                allErrors.push({
+                    function: lambdaName,
+                    date: new Date(event.timestamp).toISOString(),
+                    message: event.message.trim()
+                });
+            }
+        }
+    }
+
+    if (allErrors.length === 0) {
+        console.log("✅ Nenhum erro encontrado nas Lambdas analisadas.");
+    } else {
+        console.log("🚨 Erros encontrados:");
+        allErrors.forEach(err => {
+            console.log(`---`);
+            console.log(`📛 Lambda: ${err.function}`);
+            console.log(`📅 Data:   ${err.date}`);
+            console.log(`📝 Erro:   ${err.message}`);
+        });
+    }
+}
+
+main().catch(console.error);
